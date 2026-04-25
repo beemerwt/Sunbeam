@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+
+# Rust/Cargo
+**/*.rs.bk
+Cargo.lock
+
+# Editor stuff
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Env files (if you add any later)
+.env
