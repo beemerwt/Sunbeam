@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/sunbeam-common",
+  "crates/sunbeam-host",
+  "crates/sunbeam-agent-x11",
+  "crates/sunbeam-ctl",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
