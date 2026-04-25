@@ -52,10 +52,10 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
-    let display = env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-    let agent_id = cli.agent_id.unwrap_or_else(|| format!("x11-{display}"));
-
-    info!(%display, session = %cli.session_name, agent_id = %agent_id, "starting x11 agent");
+    let display_name = env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+    let agent_id = cli.agent_id.clone().unwrap_or_else(|| format!("x11-{display_name}"));
+    
+    info!(%display_name, session = %cli.session_name, agent_id = %agent_id, "starting x11 agent");
 
     if let Some(path) = cli.dump_frame {
         dump_synthetic_frame(&path)?;
@@ -64,15 +64,15 @@ fn main() -> Result<()> {
     }
 
     if cli.stream_frames {
-        stream_synthetic_frames(&cli, &display, &agent_id)?;
+        stream_synthetic_frames(&cli, &display_name, &agent_id)?;
         return Ok(());
     }
 
-    println!("sunbeam-agent-x11 initialized for DISPLAY={display}. Use --stream-frames for milestone 1 transport test.");
+    println!("sunbeam-agent-x11 initialized for DISPLAY={display_name}. Use --stream-frames for milestone 1 transport test.");
     Ok(())
 }
 
-fn stream_synthetic_frames(cli: &Cli, display: &str, agent_id: &str) -> Result<()> {
+fn stream_synthetic_frames(cli: &Cli, display_name: &str, agent_id: &str) -> Result<()> {
     let mut stream = UnixStream::connect(&cli.host_socket)
         .with_context(|| format!("connecting to host socket {}", cli.host_socket.display()))?;
 
@@ -80,7 +80,7 @@ fn stream_synthetic_frames(cli: &Cli, display: &str, agent_id: &str) -> Result<(
         agent_id: agent_id.to_string(),
         backend: "x11".to_string(),
         session_name: cli.session_name.clone(),
-        display: display.to_string(),
+        display: display_name.to_string(),
         width: 1280,
         height: 720,
         refresh_hz: cli.fps,
