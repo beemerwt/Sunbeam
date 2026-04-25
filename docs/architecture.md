@@ -18,13 +18,20 @@ Sunbeam is split into:
 - Convert in host to encoder formats (NV12/YUV420P).
 - Add shared-memory FD passing after basic correctness.
 
-## Milestone plan
+## Milestone status
 
-- **M0**: one-frame dump from X11 agent (`--dump-frame` scaffolded).
-- **M1**: agent registration and raw frame transfer to host.
-- **M2**: host H.264 encoding preview path.
-- **M3**: input routing to active session agent.
-- **M4**: minimal remote client for stream + input.
+- **M0**: one-frame dump from X11 agent (`--dump-frame`) ✅
+- **M1**: agent registration + raw frame transfer + host screenshot dumps ✅ (synthetic frames)
+- **M2**: host H.264 encoding preview path ⏳
+- **M3**: input routing to active session agent ⏳
+- **M4**: minimal remote client for stream + input ⏳
+
+## M1 transport details (current)
+
+- Unix domain socket between agent and host.
+- Length-prefixed JSON packet header.
+- Optional frame payload for raw BGRA bytes.
+- Host stores registered session metadata and writes periodic PNG snapshots.
 
 ## Non-goals (v0)
 

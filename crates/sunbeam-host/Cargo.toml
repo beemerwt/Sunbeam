@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 sunbeam-common = { path = "../sunbeam-common" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
