@@ -10,10 +10,19 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use sunbeam_common::{
     frame::{FrameDescriptor, PixelFormat},
+    input::InputEvent,
     session::{SessionCapabilities, SessionInfo},
-    transport::{write_packet, WireMessage, WirePacket},
+    transport::{read_packet, write_packet, WireMessage, WirePacket},
 };
-use tracing::info;
+use tracing::{info, warn};
+use x11rb::{
+    connection::Connection,
+    protocol::{
+        xproto::{ConnectionExt as _, KEY_PRESS_EVENT, KEY_RELEASE_EVENT},
+        xtest::ConnectionExt as _,
+    },
+    rust_connection::RustConnection,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "sunbeam-agent-x11")]
@@ -103,6 +112,15 @@ fn stream_synthetic_frames(cli: &Cli, display_name: &str, agent_id: &str) -> Res
         None,
     )?;
 
+    let mut input_stream = stream
+        .try_clone()
+        .context("cloning host stream for input receive loop")?;
+    thread::spawn(move || {
+        if let Err(err) = input_receive_loop(&mut input_stream) {
+            warn!(error = %err, "input receiver exited");
+        }
+    });
+
     let frame_interval = if cli.fps == 0 {
         Duration::from_millis(200)
     } else {
@@ -125,6 +143,53 @@ fn stream_synthetic_frames(cli: &Cli, display_name: &str, agent_id: &str) -> Res
         thread::sleep(frame_interval);
     }
 
+    Ok(())
+}
+
+fn input_receive_loop(stream: &mut UnixStream) -> Result<()> {
+    let (conn, screen_num) = x11rb::connect(None).context("connecting to X11 display")?;
+    let root = conn.setup().roots[screen_num].root;
+
+    loop {
+        let (packet, _) = read_packet(stream)?;
+        if let WireMessage::Input { event } = packet.message {
+            info!(?event, "received input event from host");
+            inject_input(&conn, root, &event)?;
+        }
+    }
+}
+
+fn inject_input(conn: &RustConnection, root: u32, event: &InputEvent) -> Result<()> {
+    match event {
+        InputEvent::PointerMoveAbsolute { x, y } => {
+            conn.xtest_fake_input(6, 0, 0, root, *x as i16, *y as i16, 0)
+                .context("injecting absolute pointer move")?;
+        }
+        InputEvent::PointerButton { button, pressed } => {
+            let event_type = if *pressed { 4 } else { 5 };
+            conn.xtest_fake_input(event_type, *button, 0, root, 0, 0, 0)
+                .context("injecting pointer button")?;
+        }
+        InputEvent::Key { keycode, pressed } => {
+            let detail = u8::try_from(*keycode).context("keycode out of range for X11")?;
+            let event_type = if *pressed {
+                KEY_PRESS_EVENT
+            } else {
+                KEY_RELEASE_EVENT
+            };
+            conn.xtest_fake_input(event_type, detail, 0, root, 0, 0, 0)
+                .context("injecting key event")?;
+        }
+        InputEvent::PointerMoveRelative { .. }
+        | InputEvent::Text { .. }
+        | InputEvent::GamepadButton { .. }
+        | InputEvent::GamepadAxis { .. } => {
+            warn!(?event, "input type not yet implemented for XTest injection");
+            return Ok(());
+        }
+    }
+
+    conn.flush().context("flushing X11 injected input")?;
     Ok(())
 }
 
