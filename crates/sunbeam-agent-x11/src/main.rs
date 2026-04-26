@@ -53,8 +53,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let display_name = env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-    let agent_id = cli.agent_id.clone().unwrap_or_else(|| format!("x11-{display_name}"));
-    
+    let agent_id = cli
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| format!("x11-{display_name}"));
+
     info!(%display_name, session = %cli.session_name, agent_id = %agent_id, "starting x11 agent");
 
     if let Some(path) = cli.dump_frame {
