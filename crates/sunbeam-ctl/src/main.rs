@@ -1,10 +1,21 @@
-use anyhow::Result;
+use std::{
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+};
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use sunbeam_common::input::InputEvent;
 
 #[derive(Debug, Parser)]
 #[command(name = "sunbeamctl")]
 #[command(about = "CLI control tool for Sunbeam host")]
 struct Cli {
+    /// Host control socket path
+    #[arg(long, default_value = "/tmp/sunbeam.sock.ctl")]
+    control_socket: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -13,21 +24,62 @@ struct Cli {
 enum Command {
     Sessions,
     Select { agent_id: String },
+    MoveMouse { x: i32, y: i32 },
+    MouseButton { button: u8, action: ButtonAction },
+    Key { keycode: u32, action: ButtonAction },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ButtonAction {
+    Press,
+    Release,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
-        Command::Sessions => {
-            println!("ID\tBACKEND\tNAME\tDISPLAY\tRESOLUTION");
-            println!("x11-:0\tx11\tLocal Desktop\t:0\t2560x1440");
-            println!("x11-:1\tx11\tMedia Desktop\t:1\t1920x1080");
+    let request = match cli.command {
+        Command::Sessions => "sessions".to_string(),
+        Command::Select { agent_id } => format!("select {agent_id}"),
+        Command::MoveMouse { x, y } => {
+            let event = InputEvent::PointerMoveAbsolute { x, y };
+            format!("input {}", serde_json::to_string(&event)?)
         }
-        Command::Select { agent_id } => {
-            println!("Selected active session: {agent_id}");
+        Command::MouseButton { button, action } => {
+            let event = InputEvent::PointerButton {
+                button,
+                pressed: matches!(action, ButtonAction::Press),
+            };
+            format!("input {}", serde_json::to_string(&event)?)
         }
-    }
+        Command::Key { keycode, action } => {
+            let event = InputEvent::Key {
+                keycode,
+                pressed: matches!(action, ButtonAction::Press),
+            };
+            format!("input {}", serde_json::to_string(&event)?)
+        }
+    };
 
+    let response = send_control_command(&cli.control_socket, &request)?;
+    println!("{response}");
     Ok(())
+}
+
+fn send_control_command(control_socket: &PathBuf, request: &str) -> Result<String> {
+    let mut stream = UnixStream::connect(control_socket)
+        .with_context(|| format!("connecting to control socket {}", control_socket.display()))?;
+    stream
+        .write_all(request.as_bytes())
+        .context("writing request to control socket")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("signaling end-of-request to host")?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("reading control response")?;
+
+    Ok(response)
 }

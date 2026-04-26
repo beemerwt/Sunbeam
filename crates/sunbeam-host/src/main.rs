@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
@@ -15,8 +15,9 @@ use clap::Parser;
 use image::{ImageBuffer, Rgba};
 use sunbeam_common::{
     frame::{FrameDescriptor, PixelFormat},
+    input::InputEvent,
     session::SessionInfo,
-    transport::{read_packet, WireMessage},
+    transport::{read_packet, write_packet, WireMessage, WirePacket},
 };
 use tracing::{error, info, warn};
 
@@ -56,6 +57,8 @@ struct Cli {
 #[derive(Debug, Default)]
 struct Registry {
     sessions: HashMap<String, SessionInfo>,
+    agent_writers: HashMap<String, Arc<Mutex<UnixStream>>>,
+    active_agent_id: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -74,12 +77,47 @@ fn main() -> Result<()> {
             .with_context(|| format!("removing stale socket {}", cli.socket_path.display()))?;
     }
 
+    let control_socket_path = PathBuf::from(format!("{}.ctl", cli.socket_path.display()));
+    if control_socket_path.exists() {
+        fs::remove_file(&control_socket_path).with_context(|| {
+            format!(
+                "removing stale control socket {}",
+                control_socket_path.display()
+            )
+        })?;
+    }
+
     let listener = UnixListener::bind(&cli.socket_path)
         .with_context(|| format!("binding {}", cli.socket_path.display()))?;
+    let control_listener = UnixListener::bind(&control_socket_path)
+        .with_context(|| format!("binding {}", control_socket_path.display()))?;
 
-    info!(bind = %cli.bind, socket = %cli.socket_path.display(), "sunbeam-host listening");
+    info!(
+        bind = %cli.bind,
+        socket = %cli.socket_path.display(),
+        control_socket = %control_socket_path.display(),
+        "sunbeam-host listening"
+    );
 
     let registry = Arc::new(Mutex::new(Registry::default()));
+
+    {
+        let registry = Arc::clone(&registry);
+        thread::spawn(move || {
+            for stream in control_listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        if let Err(err) = handle_control_connection(stream, &registry) {
+                            warn!(error = %err, "control connection failed");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to accept control connection");
+                    }
+                }
+            }
+        });
+    }
 
     for stream in listener.incoming() {
         match stream {
@@ -113,6 +151,108 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn handle_control_connection(
+    mut stream: UnixStream,
+    registry: &Arc<Mutex<Registry>>,
+) -> Result<()> {
+    let mut request = String::new();
+    stream
+        .read_to_string(&mut request)
+        .context("reading control request")?;
+    let request = request.trim();
+
+    let response = if request == "sessions" {
+        render_sessions(registry)
+    } else if let Some(agent_id) = request.strip_prefix("select ") {
+        select_session(registry, agent_id.trim())?
+    } else if let Some(event_json) = request.strip_prefix("input ") {
+        let event: InputEvent =
+            serde_json::from_str(event_json).context("parsing input event from control command")?;
+        forward_input_to_active_agent(registry, event)?
+    } else {
+        format!("error: unknown command '{request}'")
+    };
+
+    stream
+        .write_all(response.as_bytes())
+        .context("writing control response")?;
+    Ok(())
+}
+
+fn render_sessions(registry: &Arc<Mutex<Registry>>) -> String {
+    let registry = registry.lock().expect("registry lock poisoned");
+    render_sessions_locked(&registry)
+}
+
+fn render_sessions_locked(registry: &Registry) -> String {
+    let mut rows = vec!["ID\tBACKEND\tNAME\tDISPLAY\tRESOLUTION\tACTIVE".to_string()];
+
+    for session in registry.sessions.values() {
+        let active = registry
+            .active_agent_id
+            .as_ref()
+            .map(|id| id == &session.agent_id)
+            .unwrap_or(false);
+        rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}x{}\t{}",
+            session.agent_id,
+            session.backend,
+            session.session_name,
+            session.display,
+            session.width,
+            session.height,
+            if active { "*" } else { "" }
+        ));
+    }
+
+    rows.join("\n")
+}
+
+fn select_session(registry: &Arc<Mutex<Registry>>, agent_id: &str) -> Result<String> {
+    let mut registry = registry.lock().expect("registry lock poisoned");
+    if !registry.sessions.contains_key(agent_id) {
+        bail!("unknown session '{agent_id}'");
+    }
+
+    registry.active_agent_id = Some(agent_id.to_string());
+    Ok(format!("selected active session: {agent_id}"))
+}
+
+fn forward_input_to_active_agent(
+    registry: &Arc<Mutex<Registry>>,
+    event: InputEvent,
+) -> Result<String> {
+    let (agent_id, writer) = {
+        let registry = registry.lock().expect("registry lock poisoned");
+        let agent_id = registry
+            .active_agent_id
+            .clone()
+            .context("no active session selected")?;
+        let writer = registry
+            .agent_writers
+            .get(&agent_id)
+            .cloned()
+            .with_context(|| format!("active session '{agent_id}' is not connected"))?;
+        (agent_id, writer)
+    };
+
+    {
+        let mut writer = writer.lock().expect("writer lock poisoned");
+        write_packet(
+            &mut *writer,
+            &WirePacket {
+                message: WireMessage::Input {
+                    event: event.clone(),
+                },
+            },
+            None,
+        )
+        .with_context(|| format!("forwarding input to agent {agent_id}"))?;
+    }
+
+    Ok(format!("forwarded input to {agent_id}: {event:?}"))
+}
+
 fn handle_agent(
     mut stream: UnixStream,
     registry: Arc<Mutex<Registry>>,
@@ -125,6 +265,11 @@ fn handle_agent(
     let mut active_agent_id = String::new();
     let mut frame_index: u64 = 0;
     let mut encoder: Option<FfmpegEncoder> = None;
+    let writer = Arc::new(Mutex::new(
+        stream
+            .try_clone()
+            .context("cloning agent stream for control writes")?,
+    ));
 
     loop {
         let (packet, payload) = match read_packet(&mut stream) {
@@ -140,7 +285,7 @@ fn handle_agent(
         match packet.message {
             WireMessage::Register { session } => {
                 active_agent_id = session.agent_id.clone();
-                register_session(&registry, session)?;
+                register_session(&registry, session, Arc::clone(&writer))?;
             }
             WireMessage::Frame {
                 descriptor,
@@ -175,12 +320,19 @@ fn handle_agent(
             WireMessage::Heartbeat => {
                 info!(agent_id = %active_agent_id, "heartbeat");
             }
+            WireMessage::Input { .. } => {
+                warn!(agent_id = %active_agent_id, "received unexpected input message from agent");
+            }
         }
     }
 
     if !active_agent_id.is_empty() {
         let mut registry = registry.lock().expect("registry lock poisoned");
         registry.sessions.remove(&active_agent_id);
+        registry.agent_writers.remove(&active_agent_id);
+        if registry.active_agent_id.as_deref() == Some(active_agent_id.as_str()) {
+            registry.active_agent_id = None;
+        }
         info!(agent_id = %active_agent_id, "removed disconnected session");
     }
 
@@ -191,19 +343,23 @@ fn handle_agent(
     Ok(())
 }
 
-fn register_session(registry: &Arc<Mutex<Registry>>, session: SessionInfo) -> Result<()> {
+fn register_session(
+    registry: &Arc<Mutex<Registry>>,
+    session: SessionInfo,
+    writer: Arc<Mutex<UnixStream>>,
+) -> Result<()> {
     let mut registry = registry.lock().expect("registry lock poisoned");
     registry
         .sessions
         .insert(session.agent_id.clone(), session.clone());
-
-    println!("ID\tBACKEND\tNAME\tDISPLAY\tRESOLUTION");
-    for s in registry.sessions.values() {
-        println!(
-            "{}\t{}\t{}\t{}\t{}x{}",
-            s.agent_id, s.backend, s.session_name, s.display, s.width, s.height
-        );
+    registry
+        .agent_writers
+        .insert(session.agent_id.clone(), writer);
+    if registry.active_agent_id.is_none() {
+        registry.active_agent_id = Some(session.agent_id.clone());
     }
+
+    println!("{}", render_sessions_locked(&registry));
     info!(agent_id = %session.agent_id, "registered agent session");
     Ok(())
 }
