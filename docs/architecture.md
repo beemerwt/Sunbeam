@@ -22,7 +22,7 @@ Sunbeam is split into:
 
 - **M0**: one-frame dump from X11 agent (`--dump-frame`) ✅
 - **M1**: agent registration + raw frame transfer + host screenshot dumps ✅ (synthetic frames)
-- **M2**: host H.264 encoding preview path ⏳
+- **M2**: host H.264 encoding preview path ✅ (ffmpeg/libx264 file output)
 - **M3**: input routing to active session agent ⏳
 - **M4**: minimal remote client for stream + input ⏳
 

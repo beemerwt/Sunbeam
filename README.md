@@ -41,3 +41,31 @@ Expected behavior:
 - Host prints a session table once agent registers.
 - Host receives synthetic BGRA frames from the agent.
 - Host periodically writes PNG screenshots under `./artifacts/screenshots`.
+
+## Milestone 2 demo (local H.264 preview)
+
+Terminal A:
+
+```bash
+cargo run -p sunbeam-host -- \
+  --socket-path /tmp/sunbeam.sock \
+  --h264-output ./artifacts/preview/session-preview.mp4 \
+  --h264-fps 30
+```
+
+Terminal B:
+
+```bash
+DISPLAY=:1 cargo run -p sunbeam-agent-x11 -- \
+  --session-name "Media Desktop" \
+  --host-socket /tmp/sunbeam.sock \
+  --stream-frames \
+  --fps 30 \
+  --frame-count 300
+```
+
+Preview:
+
+```bash
+ffplay ./artifacts/preview/session-preview.mp4
+```
