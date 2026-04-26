@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{frame::FrameDescriptor, session::SessionInfo};
+use crate::{frame::FrameDescriptor, input::InputEvent, session::SessionInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WireMessage {
@@ -12,6 +12,9 @@ pub enum WireMessage {
     Frame {
         descriptor: FrameDescriptor,
         payload_len: u32,
+    },
+    Input {
+        event: InputEvent,
     },
     Heartbeat,
 }

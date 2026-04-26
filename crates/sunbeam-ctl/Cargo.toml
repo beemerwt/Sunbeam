@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+sunbeam-common = { path = "../sunbeam-common" }
+serde_json.workspace = true
