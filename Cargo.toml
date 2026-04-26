@@ -4,6 +4,7 @@ members = [
   "crates/sunbeam-host",
   "crates/sunbeam-agent-x11",
   "crates/sunbeam-ctl",
+  "crates/sunbeam-client",
 ]
 resolver = "2"
 
