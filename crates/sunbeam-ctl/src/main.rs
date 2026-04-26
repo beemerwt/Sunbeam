@@ -1,5 +1,6 @@
 use std::{
     io::{Read, Write},
+    net::TcpStream,
     os::unix::net::UnixStream,
     path::PathBuf,
 };
@@ -15,6 +16,10 @@ struct Cli {
     /// Host control socket path
     #[arg(long, default_value = "/tmp/sunbeam.sock.ctl")]
     control_socket: PathBuf,
+
+    /// Optional host:port for remote TCP control mode.
+    #[arg(long)]
+    tcp: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -61,17 +66,39 @@ fn main() -> Result<()> {
         }
     };
 
-    let response = send_control_command(&cli.control_socket, &request)?;
+    let response = if let Some(addr) = &cli.tcp {
+        send_control_command_tcp(addr, &request)?
+    } else {
+        send_control_command_unix(&cli.control_socket, &request)?
+    };
     println!("{response}");
     Ok(())
 }
 
-fn send_control_command(control_socket: &PathBuf, request: &str) -> Result<String> {
+fn send_control_command_unix(control_socket: &PathBuf, request: &str) -> Result<String> {
     let mut stream = UnixStream::connect(control_socket)
         .with_context(|| format!("connecting to control socket {}", control_socket.display()))?;
     stream
         .write_all(request.as_bytes())
         .context("writing request to control socket")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("signaling end-of-request to host")?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("reading control response")?;
+
+    Ok(response)
+}
+
+fn send_control_command_tcp(addr: &str, request: &str) -> Result<String> {
+    let mut stream =
+        TcpStream::connect(addr).with_context(|| format!("connecting to control tcp {addr}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .context("writing request to control tcp")?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .context("signaling end-of-request to host")?;

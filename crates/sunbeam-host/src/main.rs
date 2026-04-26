@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
+    net::TcpListener,
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
@@ -25,13 +26,13 @@ use tracing::{error, info, warn};
 #[command(name = "sunbeam-host")]
 #[command(about = "Global session-oriented streaming host")]
 struct Cli {
-    /// Listen address placeholder for future remote clients
-    #[arg(long, default_value = "127.0.0.1:47989")]
-    bind: String,
-
     /// Unix socket path used by session agents
     #[arg(long, default_value = "/tmp/sunbeam.sock")]
     socket_path: PathBuf,
+
+    /// TCP port used by remote control clients
+    #[arg(long, default_value_t = 47989)]
+    control_port: u16,
 
     /// Directory where host writes screenshot PNG files
     #[arg(long, default_value = "./artifacts/screenshots")]
@@ -52,6 +53,14 @@ struct Cli {
     /// x264 CRF for local preview encoding.
     #[arg(long, default_value_t = 23)]
     h264_crf: u32,
+
+    /// RTSP port exposed by host for H.264 playback.
+    #[arg(long, default_value_t = 8554)]
+    rtsp_port: u16,
+
+    /// RTSP path segment (rtsp://host:port/<path>)
+    #[arg(long, default_value = "sunbeam")]
+    rtsp_path: String,
 }
 
 #[derive(Debug, Default)]
@@ -91,11 +100,15 @@ fn main() -> Result<()> {
         .with_context(|| format!("binding {}", cli.socket_path.display()))?;
     let control_listener = UnixListener::bind(&control_socket_path)
         .with_context(|| format!("binding {}", control_socket_path.display()))?;
+    let tcp_control_addr = format!("0.0.0.0:{}", cli.control_port);
+    let tcp_control_listener = TcpListener::bind(&tcp_control_addr)
+        .with_context(|| format!("binding tcp control {tcp_control_addr}"))?;
 
     info!(
-        bind = %cli.bind,
         socket = %cli.socket_path.display(),
         control_socket = %control_socket_path.display(),
+        control_tcp = %tcp_control_addr,
+        rtsp_url = %format!("rtsp://{}:{}/{}", "127.0.0.1", cli.rtsp_port, cli.rtsp_path.trim_start_matches('/')),
         "sunbeam-host listening"
     );
 
@@ -119,6 +132,24 @@ fn main() -> Result<()> {
         });
     }
 
+    {
+        let registry = Arc::clone(&registry);
+        thread::spawn(move || {
+            for stream in tcp_control_listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        if let Err(err) = handle_control_connection(stream, &registry) {
+                            warn!(error = %err, "tcp control connection failed");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to accept tcp control connection");
+                    }
+                }
+            }
+        });
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -128,6 +159,8 @@ fn main() -> Result<()> {
                 let h264_output = cli.h264_output.clone();
                 let h264_fps = cli.h264_fps;
                 let h264_crf = cli.h264_crf;
+                let rtsp_port = cli.rtsp_port;
+                let rtsp_path = cli.rtsp_path.clone();
                 thread::spawn(move || {
                     if let Err(err) = handle_agent(
                         stream,
@@ -137,6 +170,8 @@ fn main() -> Result<()> {
                         h264_output,
                         h264_fps,
                         h264_crf,
+                        rtsp_port,
+                        rtsp_path,
                     ) {
                         error!(error = %err, "agent handler exited with error");
                     }
@@ -151,10 +186,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_control_connection(
-    mut stream: UnixStream,
-    registry: &Arc<Mutex<Registry>>,
-) -> Result<()> {
+fn handle_control_connection<T>(mut stream: T, registry: &Arc<Mutex<Registry>>) -> Result<()>
+where
+    T: Read + Write,
+{
     let mut request = String::new();
     stream
         .read_to_string(&mut request)
@@ -261,10 +296,13 @@ fn handle_agent(
     h264_output: Option<PathBuf>,
     h264_fps: u32,
     h264_crf: u32,
+    rtsp_port: u16,
+    rtsp_path: String,
 ) -> Result<()> {
     let mut active_agent_id = String::new();
     let mut frame_index: u64 = 0;
-    let mut encoder: Option<FfmpegEncoder> = None;
+    let mut file_encoder: Option<FfmpegEncoder> = None;
+    let mut rtsp_encoder: Option<FfmpegEncoder> = None;
     let writer = Arc::new(Mutex::new(
         stream
             .try_clone()
@@ -302,8 +340,8 @@ fn handle_agent(
                         continue;
                     }
 
-                    if encoder.is_none() {
-                        encoder = Some(FfmpegEncoder::spawn(
+                    if file_encoder.is_none() {
+                        file_encoder = Some(FfmpegEncoder::spawn_file(
                             output_path,
                             descriptor.width,
                             descriptor.height,
@@ -312,7 +350,33 @@ fn handle_agent(
                         )?);
                     }
 
-                    if let Some(enc) = encoder.as_mut() {
+                    if let Some(enc) = file_encoder.as_mut() {
+                        enc.write_frame(&descriptor, &payload)?;
+                    }
+                }
+
+                let is_active = {
+                    let guard = registry.lock().expect("registry lock poisoned");
+                    guard.active_agent_id.as_deref() == Some(active_agent_id.as_str())
+                };
+                if is_active {
+                    if descriptor.pixel_format != PixelFormat::Bgra8888 {
+                        warn!(agent_id = %active_agent_id, "rtsp encoder skipping non-BGRA frame");
+                        continue;
+                    }
+
+                    if rtsp_encoder.is_none() {
+                        rtsp_encoder = Some(FfmpegEncoder::spawn_rtsp(
+                            rtsp_port,
+                            &rtsp_path,
+                            descriptor.width,
+                            descriptor.height,
+                            h264_fps,
+                            h264_crf,
+                        )?);
+                    }
+
+                    if let Some(enc) = rtsp_encoder.as_mut() {
                         enc.write_frame(&descriptor, &payload)?;
                     }
                 }
@@ -336,7 +400,10 @@ fn handle_agent(
         info!(agent_id = %active_agent_id, "removed disconnected session");
     }
 
-    if let Some(enc) = encoder.as_mut() {
+    if let Some(enc) = file_encoder.as_mut() {
+        enc.finish()?;
+    }
+    if let Some(enc) = rtsp_encoder.as_mut() {
         enc.finish()?;
     }
 
@@ -423,7 +490,7 @@ struct FfmpegEncoder {
 }
 
 impl FfmpegEncoder {
-    fn spawn(output: &PathBuf, width: u32, height: u32, fps: u32, crf: u32) -> Result<Self> {
+    fn spawn_file(output: &PathBuf, width: u32, height: u32, fps: u32, crf: u32) -> Result<Self> {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating h264 output directory {}", parent.display()))?;
@@ -464,6 +531,64 @@ impl FfmpegEncoder {
             .take()
             .context("ffmpeg stdin unavailable for rawvideo feed")?;
         info!(file = %output.display(), width, height, fps, "started ffmpeg encoder");
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            width,
+            height,
+        })
+    }
+
+    fn spawn_rtsp(
+        port: u16,
+        path: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        crf: u32,
+    ) -> Result<Self> {
+        let stream_path = path.trim_start_matches('/');
+        let rtsp_url = format!("rtsp://0.0.0.0:{port}/{stream_path}");
+        let mut child = Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("bgra")
+            .arg("-s")
+            .arg(format!("{}x{}", width, height))
+            .arg("-r")
+            .arg(fps.max(1).to_string())
+            .arg("-i")
+            .arg("-")
+            .arg("-an")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("veryfast")
+            .arg("-tune")
+            .arg("zerolatency")
+            .arg("-crf")
+            .arg(crf.to_string())
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-f")
+            .arg("rtsp")
+            .arg("-rtsp_flags")
+            .arg("listen")
+            .arg(&rtsp_url)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("failed to spawn ffmpeg RTSP server (is ffmpeg installed?)")?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .context("ffmpeg rtsp stdin unavailable for rawvideo feed")?;
+        info!(rtsp_url = %rtsp_url, width, height, fps, "started ffmpeg rtsp encoder");
 
         Ok(Self {
             child,
