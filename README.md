@@ -12,9 +12,9 @@ Sunbeam is an open-source Linux streaming host prototype designed around **globa
 ## Workspace layout
 
 - `crates/sunbeam-common`: shared protocol, frame, input, and session types.
-- `crates/sunbeam-host`: global host process scaffold + milestone 1 frame ingest.
-- `crates/sunbeam-agent-x11`: per-session X11 agent scaffold + synthetic stream mode.
-- `crates/sunbeam-ctl`: control CLI scaffold.
+- `crates/sunbeam-host`: global host process scaffold + frame ingest + control socket routing.
+- `crates/sunbeam-agent-x11`: per-session X11 agent scaffold + synthetic stream mode + XTest input injection.
+- `crates/sunbeam-ctl`: control CLI for sessions + input injection commands.
 - `docs/architecture.md`: architecture and milestone plan.
 
 ## Milestone 1 demo (local)
@@ -69,3 +69,36 @@ Preview:
 ```bash
 ffplay ./artifacts/preview/session-preview.mp4
 ```
+
+## Milestone 3 demo (session selection + input injection)
+
+Sunbeam host now also exposes a control socket at:
+
+- main agent socket: `/tmp/sunbeam.sock`
+- control socket: `/tmp/sunbeam.sock.ctl`
+
+Start host and two agents (example displays `:0` and `:1`):
+
+```bash
+cargo run -p sunbeam-host -- --socket-path /tmp/sunbeam.sock
+DISPLAY=:0 cargo run -p sunbeam-agent-x11 -- --stream-frames --host-socket /tmp/sunbeam.sock --session-name "Desktop 0"
+DISPLAY=:1 cargo run -p sunbeam-agent-x11 -- --stream-frames --host-socket /tmp/sunbeam.sock --session-name "Desktop 1"
+```
+
+Use `sunbeamctl` to inspect/select sessions and inject input to the active session:
+
+```bash
+cargo run -p sunbeam-ctl -- sessions
+cargo run -p sunbeam-ctl -- select x11-:1
+cargo run -p sunbeam-ctl -- move-mouse 500 500
+cargo run -p sunbeam-ctl -- mouse-button 1 press
+cargo run -p sunbeam-ctl -- mouse-button 1 release
+cargo run -p sunbeam-ctl -- key 38 press
+cargo run -p sunbeam-ctl -- key 38 release
+```
+
+Notes:
+
+- Input injection currently implements `PointerMoveAbsolute`, `PointerButton`, and `Key` in the X11 agent.
+- Relative pointer movement, text, and gamepad input types are currently recognized by protocol but not yet injected by the X11 backend.
+- Key events use raw X11 keycodes.
