@@ -5,6 +5,8 @@ members = [
   "crates/sunbeam-agent-x11",
   "crates/sunbeam-ctl",
   "crates/sunbeam-client",
+  "crates/sunbeam-video",
+  "crates/sunbeam-gamestream",
 ]
 resolver = "2"
 
